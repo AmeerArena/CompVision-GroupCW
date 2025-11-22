@@ -88,8 +88,11 @@ def load_test_dataset(folder, size=16) -> tuple[np.ndarray, np.ndarray]:
     """
     folder = Path(folder)
     X, filenames = [], []
+    
+    # sort the images
+    sorted_img_paths = sorted([p for p in folder.iterdir() if p.suffix.lower() in VALID_EXTS], key=lambda p: int(p.stem))
 
-    for img_path in sorted(folder.iterdir()):
+    for img_path in sorted_img_paths:
         if img_path.suffix.lower() not in VALID_EXTS:
             continue
 

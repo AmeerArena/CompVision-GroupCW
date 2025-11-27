@@ -341,7 +341,7 @@ def load_test_dataset(folder):
 
     return X, np.array(filenames)
 
-def select_images_per_class(train_data, per_class=20):
+def select_images_per_class(train_data, per_class=60):
     """
     Helper function to randomly select a number of images from each category
     """
@@ -380,7 +380,7 @@ def build_vocab(train_data, clusters_number=CLUSTERS_NUMBER):
         patches = extract_patches(img)
 
         # set a max of 200 patches per image
-        patches = patches[:200]
+        patches = patches[:400]
 
         patch_samples.append(patches)
 

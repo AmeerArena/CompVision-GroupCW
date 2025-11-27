@@ -3,7 +3,7 @@ from pathlib import Path
 
 from skimage.io import imread
 from skimage.color import rgb2gray
-
+from sklearn.model_selection import train_test_split
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.svm import LinearSVC
 from sklearn.preprocessing import StandardScaler
@@ -16,10 +16,10 @@ PROJECT_ROOT = FILE_DIR.parent
 VALID_EXTS = (".jpg", ".jpeg", ".png")
 
 # Hyperparameters for SIFT-BoVW
-CLUSTERS_NUMBER = 600  # number of visual words
-DENSE_STEP = 8       # step size for dense SIFT
+CLUSTERS_NUMBER = 600      # number of visual words
+DENSE_STEP = 8             # step size for dense SIFT
 MAX_DESC_PER_IMAGE = 500   # max descriptors to sample per image for vocab
-MAX_IMAGE_SIZE = 256    # max size for the longest image side
+MAX_IMAGE_SIZE = 256       # max size for the longest image side
 
 
 def load_training_dataset(folder):
@@ -46,7 +46,6 @@ def load_training_dataset(folder):
                 continue
 
             img = imread(img_path)
-            
             if img.ndim == 3:
                 img = rgb2gray(img)
             img = img.astype(np.float32)
@@ -136,7 +135,7 @@ def dense_sift(img, step=DENSE_STEP):
     return descriptors.astype(np.float32)
 
 
-def select_images_for_vocab(images, per_image_desc=MAX_DESC_PER_IMAGE):
+def select_descriptors_for_vocab(images, per_image_desc=MAX_DESC_PER_IMAGE):
     """
     For vocabulary building: extract up to per_image_desc descriptors per image.
     """
@@ -165,7 +164,7 @@ def build_vocab(train_images, clusters_number=CLUSTERS_NUMBER):
     Build visual vocabulary with MiniBatchKMeans on SIFT descriptors from training images.
     """
     print("Extracting SIFT descriptors for vocabulary...")
-    all_desc = select_images_for_vocab(train_images)
+    all_desc = select_descriptors_for_vocab(train_images)
 
     print(f"Total descriptors for vocab: {all_desc.shape[0]}")
     print("Clustering descriptors with MiniBatchKMeans...")
@@ -193,8 +192,46 @@ def image_bovw_from_sift(img, kmeans):
     hist, _ = np.histogram(words, bins=CLUSTERS_NUMBER, range=(0, CLUSTERS_NUMBER))
 
     hist = hist.astype(np.float32)
-    hist /= (np.linalg.norm(hist) + 1e-6)  #L2 normalisation
+    hist /= (np.linalg.norm(hist) + 1e-6)  # L2 normalisation
     return hist
+
+
+def tune_and_train_svm(X, y):
+    """ 
+    Tune Linear SVM hyperparameter C using a validation set, then retrain on all data.
+    """
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=0, stratify=y
+    )
+
+    C_values = [0.01, 0.1, 1.0, 10.0, 100.0]
+    best_C = C_values[0]
+    best_acc = 0.0
+
+    for C in C_values:
+        print(f"Training Linear SVM with C={C}...")
+        clf = make_pipeline(
+            StandardScaler(),
+            LinearSVC(C=C, max_iter=5000)
+        )
+        clf.fit(X_train, y_train)
+        acc = clf.score(X_val, y_val)
+        print(f"  Validation accuracy: {acc:.4f}")
+
+        if acc > best_acc:
+            best_acc = acc
+            best_C = C
+
+    print(f"Best C on validation: {best_C} (acc = {best_acc:.4f})")
+    print("Retraining final model on all training data with best C...")
+
+    final_clf = make_pipeline(
+        StandardScaler(),
+        LinearSVC(C=best_C, max_iter=5000)
+    )
+    final_clf.fit(X, y)
+    return final_clf
 
 
 def run_sift_bovw(train_dir, test_dir, run_number=3):
@@ -211,12 +248,8 @@ def run_sift_bovw(train_dir, test_dir, run_number=3):
     X_train = np.array([image_bovw_from_sift(img, kmeans) for img in train_images])
     y_train = np.array(train_labels)
 
-    print("Training linear SVM classifier...")
-    clf = make_pipeline(
-        StandardScaler(),
-        LinearSVC(C=1.0, max_iter=5000),
-    )
-    clf.fit(X_train, y_train)
+    print("Tuning and training linear SVM classifier...")
+    clf = tune_and_train_svm(X_train, y_train)
 
     print("Loading test data...")
     test_images, filenames = load_test_dataset(test_path)

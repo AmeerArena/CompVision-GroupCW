@@ -4,13 +4,11 @@ from skimage.io import imread
 from skimage.transform import resize
 from pathlib import Path
 
-#FILE_DIR = folder where this python file lives
+# Resolve project paths relative to this script
 FILE_DIR = Path(__file__).resolve().parent
-
-# PROJECT_ROOT = project folder
 PROJECT_ROOT = FILE_DIR.parent
 
-# we only treat these as images when reading folders
+# Supported image file extensions
 VALID_EXTS = (".jpg", ".jpeg", ".png")
 
 
@@ -64,6 +62,9 @@ def tiny_image(img, size=16) -> np.ndarray:
 
     return vec
 
+# =====================================================================
+# Dataset loading
+# =====================================================================
 
 def load_training_dataset(folder, size=16) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -144,6 +145,9 @@ def load_test_dataset(folder, size=16) -> tuple[np.ndarray, np.ndarray]:
 
     return np.array(X), np.array(filenames)
 
+# =====================================================================
+# Main experiment runner (Run #1)
+# =====================================================================
 
 def run_knn(train_dir, test_dir, run_number=1, k=3, size=16):
     """

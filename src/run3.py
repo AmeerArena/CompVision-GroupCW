@@ -403,7 +403,7 @@ def run_bovw_sift_spm(train_dir, test_dir, run_number=3):
         stratify=all_labels_enc
     )
 
-    print("Building vocabulary on training split (no validation leakage)...")
+    print("Building vocabulary on training split...")
     kmeans = build_vocab(train_paths, vocab_size=VOCAB_SIZE)
 
     print("Extracting BoVW+SPM features for training split...")

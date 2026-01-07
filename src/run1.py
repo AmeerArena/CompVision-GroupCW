@@ -2,6 +2,8 @@ import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 from skimage.io import imread
 from skimage.transform import resize
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from pathlib import Path
 
 # Resolve project paths relative to this script
@@ -172,7 +174,16 @@ def run_knn(train_dir, test_dir, run_number=1, k=3, size=16):
     test_path = PROJECT_ROOT / test_dir
 
     print("Loading training data...")
-    X_train, y_train = load_training_dataset(train_path, size)
+    X, y = load_training_dataset(train_path, size)
+
+    # 80/20 train-validation split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y  # keeps class balance
+    )
 
     print("Loading test data...")
     X_test, filenames = load_test_dataset(test_path, size)
@@ -180,6 +191,12 @@ def run_knn(train_dir, test_dir, run_number=1, k=3, size=16):
     print("Training KNN...")
     knn = KNeighborsClassifier(n_neighbors=k)
     knn.fit(X_train, y_train)
+    
+    print("Evaluating on validation set...")
+    val_preds = knn.predict(X_val)
+    accuracy = accuracy_score(y_val, val_preds)
+
+    print(f"Validation accuracy: {accuracy:.4f}")
 
     print("Predicting...")
     predictions = knn.predict(X_test)

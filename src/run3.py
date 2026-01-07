@@ -1,31 +1,57 @@
+"""
+Run 3: Dense SIFT + BoVW + Spatial Pyramid + One-vs-All Linear SVM
+
+Core idea
+- Extract Dense SIFT descriptors on a regular grid
+- Learn a visual vocabulary using KMeans on training data only
+- Encode each image as a BoVW histogram with Spatial Pyramid pooling
+  1x1 + 2x2 levels capture both content and coarse layout
+- Apply power normalization then L2 normalization
+- Train a one-vs-all Linear SVM
+"""
+
+# =====================================================================
+# Imports
+# =====================================================================
+
 import numpy as np
 from pathlib import Path
 
-# Image loading and preprocessing
-from skimage.io import imread
-from skimage.color import rgb2gray
-
-# Machine learning utilities
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
-from sklearn.svm import LinearSVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
-
-# OpenCV is used for Gabor filters and HOG feature extraction
 import cv2
+
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+from sklearn.svm import LinearSVC
+from sklearn.multiclass import OneVsRestClassifier
 
 
 # =====================================================================
 # Paths and configuration
 # =====================================================================
 
-# Resolve project paths relative to this script
 FILE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = FILE_DIR.parent
 
-# Supported image file extensions
 VALID_EXTS = (".jpg", ".jpeg", ".png")
+
+# Dense SIFT settings
+SIFT_STEP = 6
+SIFT_SIZE = 8
+
+# Vocabulary size
+VOCAB_SIZE = 600
+
+# How many descriptors to sample from each image when building vocabulary
+MAX_DESC_PER_IMAGE = 250
+
+# Spatial pyramid levels
+# Level 0 is 1x1, Level 1 is 2x2
+PYRAMID_LEVELS = [1, 2]
+
+# Random seed for repeatability
+RANDOM_STATE = 0
 
 
 # =====================================================================
@@ -34,324 +60,397 @@ VALID_EXTS = (".jpg", ".jpeg", ".png")
 
 def load_training_dataset(folder):
     """
-    Loads all training images and their labels.
+    Loads training images and labels from a folder.
 
-    Expected directory structure:
+    Expected directory structure
         training/
             class_name/
-                image.jpg
+                1.jpg
+                2.jpg
 
-    :param folder: Path to the training dataset directory
-    :return images: List of grayscale training images
-    :return labels: List of class labels corresponding to each image
+    :param folder: Path to training dataset
+    :return image_paths: List of image paths
+    :return labels: List of class labels
     """
     folder = Path(folder)
-    images = []
+    image_paths = []
     labels = []
 
-    # Iterate over each class directory
     for class_dir in sorted(folder.iterdir()):
-        # Skip non-directories and hidden folders
         if not class_dir.is_dir() or class_dir.name.startswith("."):
             continue
 
-        # Folder name is used as the class label
         label = class_dir.name
 
-        # Load all images belonging to this class
         for img_path in sorted(class_dir.iterdir()):
-            # Skip non-image files
             if img_path.suffix.lower() not in VALID_EXTS:
                 continue
 
-            # Read image from disk
-            img = imread(img_path)
-
-            # Ensure image is grayscale
-            if img.ndim == 3:
-                img = rgb2gray(img)
-
-            # Store image as float for numerical stability
-            images.append(img.astype(np.float32))
+            image_paths.append(img_path)
             labels.append(label)
 
-    return images, labels
+    return image_paths, np.array(labels)
 
 
 def load_test_dataset(folder):
     """
-    Loads test images only (no labels).
+    Loads test images only.
 
-    Filenames are preserved to produce output in the required format:
-        <image_name> <predicted_class>
+    Filenames are kept so the output matches the submission format.
 
-    :param folder: Path to the test dataset directory
-    :return images: List of grayscale test images
-    :return filenames: Array of image filenames in sorted order
+    :param folder: Path to test dataset
+    :return image_paths: List of image paths
+    :return filenames: List of filenames
     """
     folder = Path(folder)
-    images = []
-    filenames = []
 
-    # Sort test images numerically to match expected submission order
     sorted_img_paths = sorted(
         [p for p in folder.iterdir() if p.suffix.lower() in VALID_EXTS],
         key=lambda p: int(p.stem)
     )
 
-    for img_path in sorted_img_paths:
-        # Load image from disk
-        img = imread(img_path)
+    image_paths = list(sorted_img_paths)
+    filenames = [p.name for p in sorted_img_paths]
 
-        # Convert to grayscale if needed
-        if img.ndim == 3:
-            img = rgb2gray(img)
+    return image_paths, filenames
 
-        # Store image data and corresponding filename
-        images.append(img.astype(np.float32))
-        filenames.append(img_path.name)
 
-    return images, np.array(filenames)
+def read_gray(path):
+    """
+    Loads an image in grayscale float32.
+
+    :param path: Path to image
+    :return img: Grayscale image array
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Could not read image: {path}")
+    return img.astype(np.float32)
 
 
 # =====================================================================
-# Feature extraction: GIST + HOG
+# Dense SIFT feature extraction
 # =====================================================================
 
-def build_gabor_filters():
+def dense_sift(img, step=SIFT_STEP, size=SIFT_SIZE):
     """
-    Builds a bank of Gabor filters for GIST feature extraction.
+    Extracts Dense SIFT descriptors on a regular grid.
 
-    Multiple orientations and scales are used to capture
-    dominant scene layout and texture patterns.
+    We use OpenCV SIFT from opencv-contrib-python.
 
-    :return filters: List of Gabor filter kernels
+    :param img: Grayscale image float32
+    :param step: Grid stride in pixels
+    :param size: Keypoint size for SIFT
+    :return desc: N x 128 array of SIFT descriptors
+    :return coords: N x 2 array of keypoint coordinates (x, y)
     """
-    filters = []
+    h, w = img.shape
 
-    # Kernel size chosen to emphasise global structure
-    ksize = 31
+    # SIFT expects uint8 input
+    img_u8 = np.clip(img, 0, 255).astype(np.uint8)
 
-    # Loop over orientations (directional sensitivity)
-    for theta in np.arange(0, np.pi, np.pi / 8):
+    sift = cv2.SIFT_create()
 
-        # Loop over scales (spatial frequency sensitivity)
-        for sigma in (2, 4, 8, 16, 32):
-            kernel = cv2.getGaborKernel(
-                (ksize, ksize),
-                sigma=sigma,
-                theta=theta,
-                lambd=10.0,
-                gamma=0.5,
-                psi=0,
-                ktype=cv2.CV_32F
-            )
-            filters.append(kernel)
+    keypoints = []
+    coords = []
 
-    return filters
+    # Dense grid of keypoints
+    for y in range(size, h - size, step):
+        for x in range(size, w - size, step):
+            keypoints.append(cv2.KeyPoint(float(x), float(y), float(size)))
+            coords.append([x, y])
+
+    if len(keypoints) == 0:
+        return np.zeros((0, 128), dtype=np.float32), np.zeros((0, 2), dtype=np.int32)
+
+    keypoints, desc = sift.compute(img_u8, keypoints)
+
+    if desc is None:
+        return np.zeros((0, 128), dtype=np.float32), np.zeros((0, 2), dtype=np.int32)
+
+    return desc.astype(np.float32), np.array(coords, dtype=np.int32)
 
 
-def image_hog(img):
+# =====================================================================
+# Vocabulary learning
+# =====================================================================
+
+def build_vocab(train_paths, vocab_size=VOCAB_SIZE, max_desc_per_image=MAX_DESC_PER_IMAGE):
     """
-    Computes a Histogram of Oriented Gradients (HOG) descriptor.
+    Builds a visual vocabulary using MiniBatchKMeans.
 
-    HOG captures local edge and shape information,
-    complementing the global GIST representation.
+    We sample a fixed number of descriptors per image for speed and balance.
 
-    :param img: Input grayscale image
-    :return hog_features: 1D HOG feature vector
+    :param train_paths: List of training image paths
+    :param vocab_size: Number of clusters
+    :param max_desc_per_image: Max descriptors to keep per image
+    :return kmeans: Trained MiniBatchKMeans
     """
-    # Ensure fixed image size required by OpenCV HOG
-    if img.shape != (256, 256):
-        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
+    all_desc = []
 
-    # Normalise pixel intensities to [0, 255]
-    img = img - img.min()
-    img = img / (img.max() + 1e-6)
-    img = (img * 255).astype(np.uint8)
+    for path in train_paths:
+        img = read_gray(path)
+        desc, _ = dense_sift(img)
 
-    # Define HOG descriptor parameters
-    hog = cv2.HOGDescriptor(
-        _winSize=(256, 256),
-        _blockSize=(64, 64),
-        _blockStride=(64, 64),
-        _cellSize=(16, 16),
-        _nbins=9
+        if desc.shape[0] == 0:
+            continue
+
+        # Randomly sample descriptors from this image
+        if desc.shape[0] > max_desc_per_image:
+            idx = np.random.choice(desc.shape[0], size=max_desc_per_image, replace=False)
+            desc = desc[idx]
+
+        all_desc.append(desc)
+
+    if len(all_desc) == 0:
+        raise RuntimeError("No SIFT descriptors found to build a vocabulary")
+
+    all_desc = np.vstack(all_desc)
+
+    kmeans = MiniBatchKMeans(
+        n_clusters=vocab_size,
+        batch_size=4096,
+        random_state=RANDOM_STATE,
+        n_init=3
     )
+    kmeans.fit(all_desc)
 
-    # Compute and flatten HOG feature vector
-    return hog.compute(img).flatten()
+    return kmeans
 
 
-def image_gist(img, filters, n_blocks=5):
+# =====================================================================
+# BoVW with Spatial Pyramid encoding
+# =====================================================================
+
+def power_l2_normalize(x, alpha=0.5, eps=1e-8):
     """
-    Computes a GIST descriptor for a single image.
+    Applies power normalization then L2 normalization.
 
-    Gabor filter responses are spatially pooled over a grid
-    to capture coarse scene layout.
+    This is very important for histogram-like features.
+    It reduces burstiness and improves linear separability.
 
-    :param img: Input grayscale image
-    :param filters: Gabor filter bank
-    :param n_blocks: Number of spatial blocks per dimension
-    :return gist_features: 1D GIST feature vector
+    :param x: Feature vector
+    :param alpha: Power exponent, 0.5 is common
+    :param eps: Numerical stability constant
+    :return x_norm: Normalized feature vector
     """
-    # Zero-mean, unit-variance normalisation
-    img = img - img.mean()
-    img = img / (img.std() + 1e-6)
+    x = np.sign(x) * (np.abs(x) ** alpha)
+    n = np.linalg.norm(x)
+    return x / (n + eps)
+
+
+def bovw_spm(img, kmeans, vocab_size=VOCAB_SIZE, pyramid_levels=PYRAMID_LEVELS):
+    """
+    Encodes an image using BoVW with Spatial Pyramid pooling.
+
+    Level 1x1 gives global content
+    Level 2x2 adds coarse layout which helps scenes a lot
+
+    Steps
+    - Extract dense SIFT descriptors and their coordinates
+    - Assign each descriptor to nearest visual word
+    - For each pyramid level, build histograms per spatial bin
+    - Concatenate all histograms
+    - Apply power and L2 normalization
+
+    :param img: Grayscale image float32
+    :param kmeans: Trained vocabulary model
+    :param vocab_size: Vocabulary size
+    :param pyramid_levels: List of grid sizes, for example [1, 2]
+    :return feat: Final feature vector
+    """
+    desc, coords = dense_sift(img)
+
+    if desc.shape[0] == 0:
+        # Return a valid zero vector if no descriptors exist
+        total_bins = sum(l * l for l in pyramid_levels)
+        feat = np.zeros(total_bins * vocab_size, dtype=np.float32)
+        return feat
+
+    words = kmeans.predict(desc)
 
     h, w = img.shape
-    block_h = h // n_blocks
-    block_w = w // n_blocks
+    feats = []
 
-    features = []
+    for l in pyramid_levels:
+        # Bin sizes in pixels
+        bin_w = w / l
+        bin_h = h / l
 
-    # Apply each Gabor filter
-    for kernel in filters:
-        response = cv2.filter2D(img, cv2.CV_32F, kernel)
+        for by in range(l):
+            for bx in range(l):
+                x0 = bx * bin_w
+                x1 = (bx + 1) * bin_w
+                y0 = by * bin_h
+                y1 = (by + 1) * bin_h
 
-        # Pool responses over spatial grid
-        for y in range(n_blocks):
-            for x in range(n_blocks):
-                block = response[
-                    y * block_h:(y + 1) * block_h,
-                    x * block_w:(x + 1) * block_w
-                ]
-                # Mean absolute response for robustness to sign
-                features.append(np.mean(np.abs(block)))
+                # Select descriptors whose keypoints fall inside this spatial bin
+                in_bin = (
+                    (coords[:, 0] >= x0) & (coords[:, 0] < x1) &
+                    (coords[:, 1] >= y0) & (coords[:, 1] < y1)
+                )
 
-    return np.array(features, dtype=np.float32)
+                bin_words = words[in_bin]
+
+                hist = np.zeros(vocab_size, dtype=np.float32)
+                if bin_words.size > 0:
+                    hist += np.bincount(bin_words, minlength=vocab_size).astype(np.float32)
+
+                feats.append(hist)
+
+    feat = np.concatenate(feats, axis=0)
+
+    # Normalize for better performance
+    feat = power_l2_normalize(feat)
+
+    return feat.astype(np.float32)
+
+
+def extract_features(paths, kmeans):
+    """
+    Extracts BoVW+SPM features for a list of image paths.
+
+    :param paths: List of image paths
+    :param kmeans: Trained vocabulary model
+    :return X: Feature matrix
+    """
+    X = []
+    for p in paths:
+        img = read_gray(p)
+        X.append(bovw_spm(img, kmeans))
+    return np.array(X, dtype=np.float32)
 
 
 # =====================================================================
-# Classifier training
+# Training and validation
 # =====================================================================
 
-def tune_and_train_svm(X, y):
+def train_and_validate_ovr_svm(X_train, y_train, X_val, y_val):
     """
-    Trains a linear SVM classifier.
+    Trains and evaluates a one-vs-all Linear SVM with a small C sweep.
 
-    A validation split is used to select the regularisation
-    parameter C before retraining on all training data.
-
-    :param X: Feature matrix for training images
-    :param y: Corresponding class labels
-    :return final_clf: Trained linear SVM classifier
-    :return best_acc: Best validation accuracy achieved
+    :param X_train: Training features
+    :param y_train: Training labels
+    :param X_val: Validation features
+    :param y_val: Validation labels
+    :return best_clf: Trained classifier with best C
+    :return best_C: Best C
+    :return best_acc: Best validation accuracy
     """
-    # Split training data into train/validation subsets
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y,
-        test_size=0.2,
-        random_state=0,
-        stratify=y
-    )
-
-    # Candidate values for SVM regularisation
-    C_values = [0.01, 0.1, 1.0]
+    C_values = [0.3, 1.0, 3.0, 10.0]
+    best_acc = -1.0
     best_C = C_values[0]
-    best_acc = 0.0
+    best_clf = None
 
     for C in C_values:
-        print(f"Training Linear SVM with C={C}...")
-
-        clf = make_pipeline(
-            # Feature scaling improves optimisation stability
-            StandardScaler(with_mean=False),
-            # Linear SVM is efficient for high-dimensional features
-            LinearSVC(C=C, max_iter=5000, class_weight="balanced")
+        clf = OneVsRestClassifier(
+            LinearSVC(C=C, class_weight="balanced", max_iter=15000),
+            n_jobs=None
         )
 
-        # Train on training split
         clf.fit(X_train, y_train)
+        pred = clf.predict(X_val)
+        acc = accuracy_score(y_val, pred)
 
-        # Evaluate on validation split
-        val_pred = clf.predict(X_val)
-        acc = accuracy_score(y_val, val_pred)
+        print(f"C={C}, validation accuracy={acc:.4f}")
 
-        print(f"  Validation accuracy: {acc:.4f}")
-
-        # Keep best performing model
         if acc > best_acc:
             best_acc = acc
             best_C = C
+            best_clf = clf
 
-    print(f"Best C on validation: {best_C} (acc = {best_acc:.4f})")
-    print("Retraining final model on all training data...")
-
-    # Retrain classifier using the selected C on full dataset
-    final_clf = make_pipeline(
-        StandardScaler(with_mean=False),
-        LinearSVC(C=best_C, max_iter=5000, class_weight="balanced")
-    )
-    final_clf.fit(X, y)
-
-    return final_clf, best_acc
+    return best_clf, best_C, best_acc
 
 
 # =====================================================================
-# Main experiment runner (Run #3)
+# Main run
 # =====================================================================
 
-def run_gist(train_dir, test_dir, run_number=3):
+def run_bovw_sift_spm(train_dir, test_dir, run_number=3):
     """
-    Complete pipeline for Run #3:
-    - load datasets
-    - extract GIST + HOG features
-    - train linear SVM
-    - predict test labels
-    - save results to run3.txt
+    Full Run 3 pipeline.
 
-    :param train_dir: Relative path to training dataset
-    :param test_dir: Relative path to test dataset
-    :param run_number: Run identifier used for output filename
+    Steps
+    - Load training paths and labels
+    - Split into training and validation
+    - Build vocabulary on training split only
+    - Encode train and val using BoVW+SPM
+    - Tune C on validation
+    - Rebuild vocabulary on full training set
+    - Retrain final classifier on full training set
+    - Predict test labels and write run3.txt
+
+    :param train_dir: Training folder name
+    :param test_dir: Testing folder name
+    :param run_number: Output run number
     """
     train_path = PROJECT_ROOT / train_dir
     test_path = PROJECT_ROOT / test_dir
 
     print("Loading training data...")
-    train_images, train_labels = load_training_dataset(train_path)
+    all_paths, all_labels = load_training_dataset(train_path)
 
-    print("Building Gabor filter bank...")
-    filters = build_gabor_filters()
+    # Encode labels consistently
+    le = LabelEncoder()
+    all_labels_enc = le.fit_transform(all_labels)
 
-    print("Extracting features for training...")
-    X_train = np.array([
-        # Concatenate global (GIST) and local (HOG) features
-        np.concatenate([image_gist(img, filters), image_hog(img)])
-        for img in train_images
-    ])
-    y_train = np.array(train_labels)
+    # Split paths and labels
+    train_paths, val_paths, y_train, y_val = train_test_split(
+        all_paths,
+        all_labels_enc,
+        test_size=0.2,
+        random_state=RANDOM_STATE,
+        stratify=all_labels_enc
+    )
 
-    print("Feature matrix shape:", X_train.shape)
+    print("Building vocabulary on training split (no validation leakage)...")
+    kmeans = build_vocab(train_paths, vocab_size=VOCAB_SIZE)
 
-    print("Training classifier...")
-    clf, val_acc = tune_and_train_svm(X_train, y_train)
+    print("Extracting BoVW+SPM features for training split...")
+    X_train = extract_features(train_paths, kmeans)
 
-    # Report training accuracy to assess overfitting
-    train_acc = clf.score(X_train, y_train)
-    print("Training accuracy:", train_acc)
-    print(f"Final validation accuracy (run {run_number}): {val_acc:.4f}")
+    print("Extracting BoVW+SPM features for validation split...")
+    X_val = extract_features(val_paths, kmeans)
+
+    print("Training classifier (validation phase)...")
+    _, best_C, val_acc = train_and_validate_ovr_svm(X_train, y_train, X_val, y_val)
+    print(f"Best C: {best_C}")
+    print(f"Validation accuracy: {val_acc:.4f}")
+
+    print("Rebuilding vocabulary on full training set...")
+    kmeans = build_vocab(all_paths, vocab_size=VOCAB_SIZE)
+
+    print("Extracting BoVW+SPM features for full training set...")
+    X_full = extract_features(all_paths, kmeans)
+
+    print("Training final classifier on full training set...")
+    final_clf = OneVsRestClassifier(
+        LinearSVC(C=best_C, class_weight="balanced", max_iter=20000),
+        n_jobs=None
+    )
+    final_clf.fit(X_full, all_labels_enc)
+
+    train_acc = accuracy_score(all_labels_enc, final_clf.predict(X_full))
+    print(f"Training accuracy: {train_acc:.4f}")
 
     print("Loading test data...")
-    test_images, filenames = load_test_dataset(test_path)
+    test_paths, filenames = load_test_dataset(test_path)
 
-    print("Extracting features for test data...")
-    X_test = np.array([
-        np.concatenate([image_gist(img, filters), image_hog(img)])
-        for img in test_images
-    ])
+    print("Extracting BoVW+SPM features for test data...")
+    X_test = extract_features(test_paths, kmeans)
 
     print("Predicting on test data...")
-    predictions = clf.predict(X_test)
+    pred_enc = final_clf.predict(X_test)
+    pred_labels = le.inverse_transform(pred_enc)
 
-    # Write predictions in required submission format
     output_name = f"run{run_number}.txt"
     with open(output_name, "w") as f:
-        for fname, pred in zip(filenames, predictions):
+        for fname, pred in zip(filenames, pred_labels):
             f.write(f"{fname} {pred}\n")
 
     print(f"Saved predictions to {output_name}")
 
 
 if __name__ == "__main__":
-    run_gist("training", "testing")
+
+    run_bovw_sift_spm("training", "testing", run_number=3)

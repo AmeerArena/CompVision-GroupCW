@@ -7,6 +7,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.linear_model import SGDClassifier
 from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 # =====================================================================
 # Paths and configuration
@@ -321,12 +323,28 @@ def run_bovw(train_dir, test_dir, run_number=2):
     train_data = load_training_dataset(train_path)
     images, labels = zip(*train_data)
 
+    train_data = load_training_dataset(train_path)
+
+    train_split, val_split = train_test_split(
+        train_data,
+        test_size=0.2,
+        random_state=42,
+        stratify=[label for _, label in train_data]
+    )
+
+    train_images, train_labels = zip(*train_split)
+    val_images, val_labels = zip(*val_split)
+
     print("Building vocabulary...")
-    kmeans = build_vocab(train_data)
+    kmeans = build_vocab(train_split)
 
     print("Extracting training BoVW features...")
-    X_train = np.array([image_bovw(img, kmeans) for img in images]) # matrix
-    y_train = np.array(labels)
+    X_train = np.array([image_bovw(img, kmeans) for img in train_images])
+    y_train = np.array(train_labels)
+
+    print("Extracting validation BoVW features...")
+    X_val = np.array([image_bovw(img, kmeans) for img in val_images])
+    y_val = np.array(val_labels)
 
     # Train one-vs-all classifiers
     classes = sorted(set(y_train))
@@ -336,6 +354,26 @@ def run_bovw(train_dir, test_dir, run_number=2):
         print("Training classifier for class: {c}")
         classifier = train_binary_classifer(X_train, y_train, c)
         classifiers[c] = classifier
+    
+    print("Evaluating on validation set...")
+    val_predictions = []
+
+    for feat in X_val:
+        pred = predict_one_vs_all(classifiers, feat.reshape(1, -1))
+        val_predictions.append(pred)
+
+    accuracy = accuracy_score(y_val, val_predictions)
+    print(f"Validation accuracy: {accuracy:.4f}")
+
+    print("Rebuilding vocabulary on full training set...")
+    kmeans = build_vocab(train_data)
+
+    X_full = np.array([image_bovw(img, kmeans) for img, _ in train_data])
+    y_full = np.array([label for _, label in train_data])
+
+    classifiers = {}
+    for c in sorted(set(y_full)):
+        classifiers[c] = train_binary_classifer(X_full, y_full, c)
 
 
     print("Loading test data...")
@@ -356,3 +394,9 @@ def run_bovw(train_dir, test_dir, run_number=2):
             f.write(f"{fname} {pred}\n")
 
     print(f"Saved predictions to {output_name}")
+
+def main():
+    run_bovw("training", "testing", run_number=2)
+
+if __name__ == "__main__":
+    main()
